@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CSC 8830 - Assignment 3 | Real-Time Computer Vision</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; }
+        h1 { color: #333; }
+        .container { margin-top: 20px; }
+        .video-stream { border: 3px solid #007bff; border-radius: 8px; max-width: 90%; height: auto; }
+        .nav-links { margin-bottom: 20px; }
+        .nav-links a {
+            padding: 10px 15px;
+            margin: 0 5px;
+            text-decoration: none;
+            background-color: #f8f9fa;
+            border: 1px solid #ced4da;
+            border-radius: 5px;
+            color: #495057;
+        }
+        .nav-links a.active {
+            background-color: #007bff;
+            color: white;
+            border-color: #007bff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>CSC 8830: Assignment 3 Demonstration</h1>
+
+        <div class="nav-links">
+            {% for id, info in modes.items() %}
+                <a href="{{ url_for('index', exercise_id=id) }}"
+                   class="{% if id == mode_id %}active{% endif %}"
+                   title="{{ info[0] }}">
+                   Ex {{ id }}
+                </a>
+            {% endfor %}
+        </div>
+
+        <h2>Current Mode: Exercise {{ mode_id }}: {{ mode_name }}</h2>
+
+        <img class="video-stream"
+             src="{{ url_for('video_feed', mode_id=mode_id) }}"
+             alt="Real-Time Video Feed">
+
+        <p>Use the links above to switch between the four exercises.</p>
+    </div>
+</body>
+</html>
