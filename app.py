@@ -1,258 +1,644 @@
-# app.py (Complete Code for Exercises 1-4)
-
 import cv2
-import cv2.aruco as aruco
 import numpy as np
-from flask import Flask, Response, render_template
+import os
+import math
+import base64
+from flask import Flask, request, redirect, url_for, render_template_string, send_from_directory
+from werkzeug.utils import secure_filename
+# Import helper functions
+from AruCo import process_image
+from filters import process_log_gradient
+from KeypointDetector import process_keypoint_detection  # NEW IMPORT
 
-# --- CONFIGURATION ---
-
-# Dictionary to map exercise ID to a display name and the processing function
-EXERCISE_MODES = {
-    '1': ('Gradient & LoG', 'process_gradient_log'),
-    '2': ('Canny & Harris Keypoints', 'process_keypoints'),
-    '3': ('Object Boundary (Contours)', 'process_boundary'),
-    '4': ('ArUco Segmentation', 'process_aruco_segmentation')
-}
-
-
-# --- CAMERA AND PROCESSING CLASS ---
-
-class VideoProcessor:
-    """
-    Handles camera capture and contains all CV logic for Assignment 3 exercises.
-    """
-
-    def __init__(self, camera_index=0):
-        self.video = cv2.VideoCapture(camera_index)
-        if not self.video.isOpened():
-            print("Error: Could not open video stream. Check camera index.")
-
-        # ArUco Setup (for Exercise 4)
-        self.aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-        self.aruco_params = aruco.DetectorParameters()
-        self.aruco_detector = aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
-
-    def __del__(self):
-        self.video.release()
-
-    # --------------------------------------------------------------------------
-    # Exercise 1: Gradient & LoG (as provided before)
-    # --------------------------------------------------------------------------
-    def process_gradient_log(self, frame):
-        """Finds Gradient Magnitude/Angle and LoG."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
-        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
-
-        magnitude, angle = cv2.cartToPolar(sobelx, sobely, angleInDegrees=True)
-        cv2.normalize(magnitude, magnitude, 0, 255, cv2.NORM_MINMAX)
-        magnitude_8u = np.uint8(magnitude)
-        angle_8u = np.uint8(angle / 360 * 255)
-
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        log = cv2.Laplacian(blur, cv2.CV_64F, ksize=5)
-        cv2.normalize(np.absolute(log), log, 0, 255, cv2.NORM_MINMAX)
-        log_8u = np.uint8(log)
-
-        # Visualization setup (Stacking images)
-        h, w = gray.shape[:2]
-        new_h = int(h / 2)
-
-        gray_3ch = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        mag_3ch = cv2.cvtColor(magnitude_8u, cv2.COLOR_GRAY2BGR)
-        angle_3ch = cv2.cvtColor(angle_8u, cv2.COLOR_GRAY2BGR)
-        log_3ch = cv2.cvtColor(log_8u, cv2.COLOR_GRAY2BGR)
-
-        top_row = cv2.resize(np.hstack([gray_3ch, mag_3ch]), (w, new_h))
-        bottom_row = cv2.resize(np.hstack([angle_3ch, log_3ch]), (w, new_h))
-        final_output = np.vstack([top_row, bottom_row])
-
-        # Labels for verification
-        cv2.putText(final_output, 'Original | Magnitude', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(final_output, 'Angle | LoG', (10, new_h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        return final_output
-
-    # --------------------------------------------------------------------------
-    # Exercise 2: Edge (Canny) & Corner (Harris) Keypoints
-    # --------------------------------------------------------------------------
-    def process_keypoints(self, frame):
-        """Implements Canny Edge and Harris Corner detection."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # --- EDGE DETECTION (Canny) ---
-        # The Canny algorithm is the standard simple, effective edge detector.
-        canny = cv2.Canny(gray, threshold1=100, threshold2=200)
-
-        # --- CORNER DETECTION (Harris) ---
-        # Harris is a classic, simple corner detection algorithm.
-        harris_dst = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
-
-        # Dilate for visibility and normalize
-        harris_dst = cv2.dilate(harris_dst, None)
-        cv2.normalize(harris_dst, harris_dst, 0, 255, cv2.NORM_MINMAX)
-        harris_8u = np.uint8(harris_dst)
-
-        # Draw corners on the original color frame for better visualization
-        corner_frame = frame.copy()
-        # Threshold the Harris response to draw keypoints
-        corner_frame[harris_8u > 0.01 * harris_8u.max()] = [0, 0, 255]  # Mark corners in red
-
-        # Visualization setup
-        canny_3ch = cv2.cvtColor(canny, cv2.COLOR_GRAY2BGR)
-
-        h, w = frame.shape[:2]
-        new_h = int(h / 2)
-
-        top_row = cv2.resize(np.hstack([frame, canny_3ch]), (w, new_h))
-        bottom_row = cv2.resize(np.hstack([corner_frame, np.zeros_like(frame)]),
-                                (w, new_h))  # Fill last quadrant with black
-        final_output = np.vstack([top_row, bottom_row])
-
-        # Labels
-        cv2.putText(final_output, 'Original | Canny Edges', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(final_output, 'Harris Corners', (10, new_h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        return final_output
-
-    # --------------------------------------------------------------------------
-    # Exercise 3: Object Boundary Detection (Contours)
-    # --------------------------------------------------------------------------
-    def process_boundary(self, frame):
-        """Finds the boundary (contour) of the main object."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Preprocessing: Use simple thresholding to get a binary mask of the object
-        # Assuming the object is darker/lighter than the background
-        _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)
-
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # Find the largest contour (most likely the main object)
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-
-            # Draw the boundary on the original color frame
-            contour_frame = frame.copy()
-            # Draw the contour (boundary) in green with thickness 3
-            cv2.drawContours(contour_frame, [largest_contour], -1, (0, 255, 0), 3)
-
-            # Draw the bounding box (optional, for verification)
-            x, y, w, h = cv2.boundingRect(largest_contour)
-            cv2.rectangle(contour_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)  # Blue box
-        else:
-            contour_frame = frame.copy()
-
-        # Visualization
-        cv2.putText(contour_frame, 'Object Boundary (Largest Contour)', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (0, 255, 255), 2)
-        return contour_frame
-
-    # --------------------------------------------------------------------------
-    # Exercise 4: Object Segmentation with ArUco Markers
-    # --------------------------------------------------------------------------
-    def process_aruco_segmentation(self, frame):
-        """Detects ArUco markers and interpolates the boundary."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Detect ArUco markers
-        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
-
-        segmentation_frame = frame.copy()
-
-        # Check if markers were found
-        if ids is not None:
-            # Draw the detected markers (optional, but useful for verification)
-            aruco.drawDetectedMarkers(segmentation_frame, corners, ids)
-
-            # Extract marker centers to define the boundary points
-            boundary_points = []
-
-            # Assuming the markers are stuck on the object boundary and are ordered
-            # We'll use the center of each detected marker as a boundary point
-            for corner in corners:
-                # Calculate the center (mean of the four corner points)
-                center_x = int(np.mean(corner[0, :, 0]))
-                center_y = int(np.mean(corner[0, :, 1]))
-                boundary_points.append([center_x, center_y])
-
-                # Draw a circle on the center point (keypoint)
-                cv2.circle(segmentation_frame, (center_x, center_y), 5, (0, 0, 255), -1)  # Red circle
-
-            # Convert points to NumPy array and reshape for cv2.polylines
-            if len(boundary_points) > 2:
-                points_np = np.array(boundary_points, dtype=np.int32).reshape((-1, 1, 2))
-
-                # Draw the segmented boundary by connecting the points (closed polygon)
-                # isClosed=True ensures the boundary is segmented completely
-                cv2.polylines(segmentation_frame, [points_np], isClosed=True, color=(255, 0, 0),
-                              thickness=3)  # Blue line
-
-        # Labels
-        cv2.putText(segmentation_frame, 'ArUco Boundary Segmentation', (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (255, 255, 0), 2)
-
-        return segmentation_frame
-
-    # --------------------------------------------------------------------------
-    # Streaming Function
-    # --------------------------------------------------------------------------
-    def get_frame(self, exercise_mode):
-        """Reads a frame and calls the corresponding processing function."""
-        success, frame = self.video.read()
-        if not success:
-            return None
-
-        # Call the processing function based on the mode ID
-        try:
-            func_name = EXERCISE_MODES.get(exercise_mode)[1]
-            processing_func = getattr(self, func_name)
-            processed_frame = processing_func(frame)
-        except Exception as e:
-            # Fallback to original frame if mode is invalid or error occurs
-            processed_frame = frame
-            cv2.putText(processed_frame, f'Error in mode {exercise_mode}: {e}', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (0, 0, 255), 2)
-            print(f"Error processing frame: {e}")
-
-        # Encode the processed frame to JPEG format for web streaming
-        ret, jpeg = cv2.imencode('.jpg', processed_frame)
-        return jpeg.tobytes()
-
-
-# --- FLASK APPLICATION SETUP ---
-
+# --- Configuration ---
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 app = Flask(__name__)
-# Initialize the camera only once
-camera = VideoProcessor(camera_index=0)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Max upload size 16MB
+
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
 
 
-def generate_frames(exercise_mode):
-    """Generator function that streams frames to the web browser."""
-    while True:
-        frame = camera.get_frame(exercise_mode=exercise_mode)
-        if frame is None:
-            break
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+# --- Helper Functions (Your Existing Edge Detector Logic) ---
+
+def allowed_file(filename):
+    return '.' in filename and \
+        filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-@app.route('/')
-@app.route('/<exercise_id>')
-def index(exercise_id='1'):
-    """Renders the main page, defaulting to Exercise 1."""
-    mode_info = EXERCISE_MODES.get(exercise_id, ('Invalid Mode', ''))
-    return render_template('index.html', mode_id=exercise_id, mode_name=mode_info[0], modes=EXERCISE_MODES)
+def find_object_boundaries_simple(image_path):
+    """
+    Implements your original object detection logic:
+    Thresholding -> Contours -> Bounding Box.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Thresholding and Inversion (matching your original logic)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh = cv2.bitwise_not(thresh)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return img
+
+    largest_contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(largest_contour)
+
+    # Draw Green Bounding Box on the original color image
+    cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+
+    return img
 
 
-@app.route('/video_feed/<mode_id>')
-def video_feed(mode_id):
-    """The video streaming route."""
-    return Response(generate_frames(mode_id),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+# --- HTML Templates (Updated and New) ---
+
+MAIN_MENU_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CV Projects Menu</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .container-shadow {
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+        }
+        .menu-button {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem 2rem;
+            font-size: 1.25rem;
+            font-weight: bold;
+            border-radius: 0.75rem;
+            transition: all 0.2s;
+            transform: scale(1);
+        }
+        .menu-button:hover {
+            transform: scale(1.02);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 font-sans flex items-center justify-center">
+    <div class="max-w-xl w-full mx-auto text-center">
+        <header class="mb-10">
+            <h1 class="text-5xl font-extrabold text-gray-800 mb-2">Computer Vision Exercises</h1>
+            <p class="text-lg text-indigo-500">Select an exercise to begin.</p>
+        </header>
+
+        <div class="space-y-6">
+            <a href="{{ url_for('aruco_detector_index') }}" 
+               class="menu-button bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg shadow-indigo-300">
+               <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.723A1 1 0 013 16.382V5.618a1 1 0 011.553-.894L9 7m0 13l6-3m-6 3V7m6 10l4.447 2.223a1 1 0 001.553-.894V6.382a1 1 0 00-.553-.894L15 4m0 13V4"></path></svg>
+               ArUco Boundary Detector
+            </a>
+
+            <a href="{{ url_for('keypoint_detector_index') }}" 
+               class="menu-button bg-blue-600 text-white hover:bg-blue-700 shadow-lg shadow-blue-300">
+               <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.794v6.412a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+               Edge & Corner Keypoint Detection
+            </a>
+
+            <a href="{{ url_for('log_gradient_detector_index') }}" 
+               class="menu-button bg-green-600 text-white hover:bg-green-700 shadow-lg shadow-green-300">
+               <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354v15.292m0 0l-5.836-5.836m5.836 5.836l5.836-5.836M3 10.354a9 9 0 1118 0"></path></svg>
+               LoG & Gradient Analysis
+            </a>
+
+            <a href="{{ url_for('edge_detector_index') }}" 
+               class="menu-button bg-gray-200 text-gray-800 hover:bg-gray-300 shadow-md shadow-gray-300">
+               <svg class="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12l3-3 3 3 3-3M3 21h18"></path></svg>
+               Edge/Object Detector
+            </a>
+        </div>
+
+        <footer class="mt-12 text-sm text-gray-400">
+            Navigation System
+        </footer>
+    </div>
+</body>
+</html>
+"""
+
+ARUCO_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ArUco Object Boundary Detector</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .container-shadow {
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 font-sans">
+    <div class="max-w-4xl mx-auto">
+        <header class="text-center mb-8">
+             <a href="{{ url_for('main_menu') }}" class="text-indigo-500 hover:underline mb-4 block">&larr; Back to Menu</a>
+            <h1 class="text-4xl font-extrabold text-indigo-700">Object Boundary Segmentation (ArUco)</h1>
+            <p class="mt-2 text-gray-600">Approximate non-rectangular object boundaries using ArUco markers (Dictionary 6x6_250).</p>
+        </header>
+
+        <!-- Upload Form -->
+        <div class="bg-white p-6 sm:p-8 rounded-xl container-shadow mb-8">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">1. Upload Image</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                Capture an image of your object with markers and upload it here.
+            </p>
+
+            <form action="{{ url_for('upload_file_aruco') }}" method="post" enctype="multipart/form-data" class="space-y-4">
+                <input type="file" name="file" accept="image/*" required 
+                       class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 cursor-pointer">
+
+                <button type="submit" 
+                        class="w-full py-3 px-4 bg-indigo-600 text-white font-bold rounded-lg hover:bg-indigo-700 transition duration-150 transform hover:scale-[1.01] shadow-md shadow-indigo-300">
+                    Find Boundary
+                </button>
+            </form>
+        </div>
+
+        <!-- Result Display -->
+        {% if image_data %}
+        <div class="bg-white p-6 sm:p-8 rounded-xl container-shadow">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">2. Result</h2>
+            <div class="text-center mb-4">
+                {% if num_markers > 0 %}
+                <p class="text-green-600 font-medium">✅ Success! Detected {{ num_markers }} markers and drew the boundary.</p>
+                {% else %}
+                <p class="text-orange-600 font-medium">⚠️ Warning: No ArUco markers detected. Please ensure markers are clearly visible.</p>
+                {% endif %}
+            </div>
+
+            <div class="relative overflow-x-auto rounded-lg shadow-xl border-4 border-gray-100">
+                <img src="{{ image_data }}" alt="Processed Image with Boundary" class="w-full h-auto object-contain max-w-none">
+                <div class="absolute top-0 right-0 m-3 p-2 bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-lg">
+                    Processed Output
+                </div>
+            </div>
+        </div>
+        {% elif error %}
+        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl relative container-shadow" role="alert">
+            <strong class="font-bold">Processing Error!</strong>
+            <span class="block sm:inline">{{ error }}</span>
+        </div>
+        {% endif %}
+
+        <footer class="mt-8 text-center text-sm text-gray-400">
+            ArUco Detector powered by Python, Flask, and OpenCV.
+        </footer>
+    </div>
+</body>
+</html>
+"""
+
+EDGE_DETECTOR_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edge Detection</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .container-shadow {
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 font-sans">
+    <div class="max-w-4xl mx-auto">
+        <header class="text-center mb-8">
+            <a href="{{ url_for('main_menu') }}" class="text-gray-500 hover:underline mb-4 block">&larr; Back to Menu</a>
+            <h1 class="text-4xl font-extrabold text-gray-700">Edge/Object Detector</h1>
+            <p class="mt-2 text-gray-500">Upload, process, and see the bounding box results.</p>
+        </header>
+
+        <!-- Upload Form -->
+        <div class="bg-white p-6 sm:p-8 rounded-xl container-shadow mb-8">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">1. Upload Image</h2>
+
+            <form action="{{ url_for('upload_file_edge') }}" method="post" enctype="multipart/form-data" class="space-y-4">
+                <input type="file" name="file" accept="image/*" required 
+                       class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-gray-100 file:text-gray-700 hover:file:bg-gray-200 cursor-pointer">
+
+                <button type="submit" 
+                        class="w-full py-3 px-4 bg-gray-600 text-white font-bold rounded-lg hover:bg-gray-700 transition duration-150 transform hover:scale-[1.01] shadow-md shadow-gray-300">
+                    Run Detection
+                </button>
+            </form>
+        </div>
+
+        <!-- Results Display -->
+        {% if original_file %}
+        <div class="bg-white p-6 sm:p-8 rounded-xl container-shadow">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">2. Results</h2>
+            <div class="grid md:grid-cols-2 gap-6">
+                <div>
+                    <h3 class="font-bold text-center mb-2">Original</h3>
+                    <img src="{{ url_for('uploaded_file', filename=original_file) }}" alt="Original Image" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+                <div>
+                    <h3 class="font-bold text-center mb-2">Processed (Bounding Box)</h3>
+                    <img src="{{ url_for('uploaded_file', filename=processed_file) }}" alt="Processed Image" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        <footer class="mt-8 text-center text-sm text-gray-400">
+            Edge Detector powered by Python, Flask, and OpenCV.
+        </footer>
+    </div>
+</body>
+</html>
+"""
+
+LOG_GRADIENT_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LoG and Gradient Analysis</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .container-shadow {
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 font-sans">
+    <div class="max-w-6xl mx-auto">
+        <header class="text-center mb-8">
+            <a href="{{ url_for('main_menu') }}" class="text-green-600 hover:underline mb-4 block">&larr; Back to Menu</a>
+            <h1 class="text-4xl font-extrabold text-green-700">LoG & Gradient Filter Analysis</h1>
+            <p class="mt-2 text-gray-600">Analyze image derivatives (Gradient) and second derivatives (Laplacian of Gaussian).</p>
+        </header>
+
+        <!-- Upload Form -->
+        <div class="bg-white p-6 sm:p-8 rounded-xl container-shadow mb-8">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">1. Upload Image</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                Upload any image to calculate its magnitude, angle, and LoG filters.
+            </p>
+
+            <form action="{{ url_for('upload_file_log_gradient') }}" method="post" enctype="multipart/form-data" class="space-y-4">
+                <input type="file" name="file" accept="image/*" required 
+                       class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-green-50 file:text-green-700 hover:file:bg-green-100 cursor-pointer">
+
+                <button type="submit" 
+                        class="w-full py-3 px-4 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 transition duration-150 transform hover:scale-[1.01] shadow-md shadow-green-300">
+                    Calculate Filters
+                </button>
+            </form>
+        </div>
+
+        <!-- Results Display -->
+        {% if results %}
+        <div class="bg-white p-6 sm:p-8 rounded-xl container-shadow">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">2. Results Comparison</h2>
+
+            <div class="grid md:grid-cols-4 gap-4">
+
+                <div class="col-span-4 md:col-span-1 text-center font-semibold p-2 bg-gray-100 rounded-lg">
+                    Original
+                </div>
+                <div class="col-span-4 md:col-span-1 text-center font-semibold p-2 bg-yellow-100 rounded-lg">
+                    Gradient Magnitude (First Derivative)
+                </div>
+                <div class="col-span-4 md:col-span-1 text-center font-semibold p-2 bg-yellow-100 rounded-lg">
+                    Gradient Angle (First Derivative)
+                </div>
+                <div class="col-span-4 md:col-span-1 text-center font-semibold p-2 bg-red-100 rounded-lg">
+                    Laplacian of Gaussian (Second Derivative)
+                </div>
+
+                <!-- Images Row -->
+                <div class="col-span-4 md:col-span-1">
+                    <img src="{{ url_for('uploaded_file', filename=results.original_file) }}" alt="Original Image" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+                <div class="col-span-4 md:col-span-1">
+                    <img src="{{ url_for('uploaded_file', filename=results.magnitude_file) }}" alt="Gradient Magnitude" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+                <div class="col-span-4 md:col-span-1">
+                    <img src="{{ url_for('uploaded_file', filename=results.angle_file) }}" alt="Gradient Angle" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+                <div class="col-span-4 md:col-span-1">
+                    <img src="{{ url_for('uploaded_file', filename=results.log_file) }}" alt="Laplacian of Gaussian" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+            </div>
+
+            <h3 class="text-xl font-bold mt-8 mb-4 text-gray-800">Comparison Note:</h3>
+            <ul class="list-disc list-inside text-gray-600 space-y-2 bg-gray-50 p-4 rounded-lg">
+                <li><strong class="text-yellow-700">Gradient Magnitude</strong> shows strong edges as bright lines, responding to large intensity changes.</li>
+                <li><strong class="text-yellow-700">Gradient Angle</strong> shows the direction of the edge (intensity change), visualized here by varying brightness/color.</li>
+                <li><strong class="text-red-700">LoG</strong> is often used for edge detection, where zero-crossings in the filter output correspond to the precise edge location. This visualized result shows where intensity changes rapidly.</li>
+            </ul>
+        </div>
+        {% elif error %}
+        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl relative container-shadow" role="alert">
+            <strong class="font-bold">Processing Error!</strong>
+            <span class="block sm:inline">{{ error }}</span>
+        </div>
+        {% endif %}
+
+        <footer class="mt-8 text-center text-sm text-gray-400">
+            Filter Analysis powered by Python, Flask, and OpenCV.
+        </footer>
+    </div>
+</body>
+</html>
+"""
+
+KEYPOINT_DETECTOR_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edge and Corner Keypoints</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .container-shadow {
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 font-sans">
+    <div class="max-w-4xl mx-auto">
+        <header class="text-center mb-8">
+            <a href="{{ url_for('main_menu') }}" class="text-blue-600 hover:underline mb-4 block">&larr; Back to Menu</a>
+            <h1 class="text-4xl font-extrabold text-blue-700">Edge & Corner Keypoint Detection</h1>
+            <p class="mt-2 text-gray-600">Implementation of Canny (Edge) and Harris (Corner) keypoint detectors.</p>
+        </header>
+
+        <!-- Upload Form -->
+        <div class="bg-white p-6 sm:p-8 rounded-xl container-shadow mb-8">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">1. Upload Image</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                Upload any image to find its primary edge and corner keypoints.
+            </p>
+
+            <form action="{{ url_for('upload_file_keypoint') }}" method="post" enctype="multipart/form-data" class="space-y-4">
+                <input type="file" name="file" accept="image/*" required 
+                       class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer">
+
+                <button type="submit" 
+                        class="w-full py-3 px-4 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 transition duration-150 transform hover:scale-[1.01] shadow-md shadow-blue-300">
+                    Detect Keypoints
+                </button>
+            </form>
+        </div>
+
+        <!-- Results Display -->
+        {% if results %}
+        <div class="bg-white p-6 sm:p-8 rounded-xl container-shadow">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">2. Detected Keypoints</h2>
+
+            <div class="grid md:grid-cols-3 gap-6">
+
+                <div class="text-center font-semibold p-2 bg-gray-100 rounded-lg">
+                    Original
+                </div>
+                <div class="text-center font-semibold p-2 bg-green-100 rounded-lg">
+                    Edge Keypoints (Canny)
+                </div>
+                <div class="text-center font-semibold p-2 bg-red-100 rounded-lg">
+                    Corner Keypoints (Harris)
+                </div>
+
+                <!-- Images Row -->
+                <div>
+                    <img src="{{ url_for('uploaded_file', filename=results.original_file) }}" alt="Original Image" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+                <div>
+                    <img src="{{ url_for('uploaded_file', filename=results.edge_file) }}" alt="Edge Keypoints" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+                <div>
+                    <img src="{{ url_for('uploaded_file', filename=results.corner_file) }}" alt="Corner Keypoints" class="w-full h-auto rounded-lg border shadow-inner">
+                </div>
+            </div>
+
+            <h3 class="text-xl font-bold mt-8 mb-4 text-gray-800">Detection Summary:</h3>
+            <ul class="list-disc list-inside text-gray-600 space-y-2 bg-gray-50 p-4 rounded-lg">
+                <li><strong class="text-green-700">Edge Keypoints</strong> are pixels where intensity changes abruptly (first derivative is high). Canny finds these robustly.</li>
+                <li><strong class="text-red-700">Corner Keypoints</strong> are points where the gradient changes direction rapidly. Harris detects these points by observing large, simultaneous intensity changes in both the X and Y directions.</li>
+            </ul>
+        </div>
+        {% elif error %}
+        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl relative container-shadow" role="alert">
+            <strong class="font-bold">Processing Error!</strong>
+            <span class="block sm:inline">{{ error }}</span>
+        </div>
+        {% endif %}
+
+        <footer class="mt-8 text-center text-sm text-gray-400">
+            Keypoint Detector powered by Python, Flask, and OpenCV.
+        </footer>
+    </div>
+</body>
+</html>
+"""
 
 
-# --- RUN THE APPLICATION ---
+# --- Flask Routes ---
+
+@app.route('/', methods=['GET'])
+def main_menu():
+    """Renders the central menu page."""
+    return render_template_string(MAIN_MENU_HTML)
+
+
+# --- 1. Edge Detector Routes (Your Previous Work) ---
+
+@app.route('/edge-detector', methods=['GET'])
+def edge_detector_index():
+    """Renders the Edge Detection upload page."""
+    return render_template_string(EDGE_DETECTOR_HTML_TEMPLATE, original_file=None, processed_file=None)
+
+
+@app.route('/upload-edge', methods=['POST'])
+def upload_file_edge():
+    """Handles file upload and processing for Edge Detection."""
+    if 'file' not in request.files:
+        return redirect(url_for('edge_detector_index'))
+
+    file = request.files['file']
+
+    if file.filename == '' or not allowed_file(file.filename):
+        return redirect(url_for('edge_detector_index'))
+
+    if file:
+        base_filename = secure_filename(file.filename)
+        original_filename = 'original_' + base_filename
+        processed_filename = 'processed_' + base_filename
+
+        original_filepath = os.path.join(app.config['UPLOAD_FOLDER'], original_filename)
+        file.save(original_filepath)
+
+        processed_img = find_object_boundaries_simple(original_filepath)
+
+        processed_filepath = os.path.join(app.config['UPLOAD_FOLDER'], processed_filename)
+        cv2.imwrite(processed_filepath, processed_img)
+
+        return render_template_string(EDGE_DETECTOR_HTML_TEMPLATE,
+                                      original_file=original_filename,
+                                      processed_file=processed_filename)
+
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    """Serves the image files (both original and processed)."""
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+
+# --- 2. ArUco Detector Routes ---
+
+@app.route('/aruco-detector', methods=['GET'])
+def aruco_detector_index():
+    """Renders the ArUco upload page."""
+    return render_template_string(ARUCO_HTML_TEMPLATE, image_data=None, error=None, num_markers=0)
+
+
+@app.route('/upload-aruco', methods=['POST'])
+def upload_file_aruco():
+    """Handles image upload and processing for ArUco (in-memory)."""
+    if 'file' not in request.files:
+        return render_template_string(ARUCO_HTML_TEMPLATE, error="No file part in the request.", image_data=None,
+                                      num_markers=0)
+
+    file = request.files['file']
+
+    if file.filename == '':
+        return render_template_string(ARUCO_HTML_TEMPLATE, error="No selected file.", image_data=None, num_markers=0)
+
+    if file:
+        try:
+            image_data = file.read()
+
+            result_data_url, num_markers = process_image(image_data)
+
+            if result_data_url.startswith("Error"):
+                return render_template_string(ARUCO_HTML_TEMPLATE, error=result_data_url, image_data=None,
+                                              num_markers=0)
+
+            return render_template_string(ARUCO_HTML_TEMPLATE, image_data=result_data_url, error=None,
+                                          num_markers=num_markers)
+
+        except Exception as e:
+            print(f"Error during ArUco processing: {e}")
+            return render_template_string(ARUCO_HTML_TEMPLATE,
+                                          error=f"An unexpected error occurred during ArUco processing: {e}",
+                                          image_data=None, num_markers=0)
+
+    return render_template_string(ARUCO_HTML_TEMPLATE, error="Unknown file error.", image_data=None, num_markers=0)
+
+
+# --- 3. LoG & Gradient Detector Routes ---
+
+@app.route('/log-gradient-detector', methods=['GET'])
+def log_gradient_detector_index():
+    """Renders the LoG/Gradient upload page."""
+    return render_template_string(LOG_GRADIENT_HTML_TEMPLATE, results=None, error=None)
+
+
+@app.route('/upload-log-gradient', methods=['POST'])
+def upload_file_log_gradient():
+    """Handles file upload and processing for LoG/Gradient analysis."""
+    if 'file' not in request.files:
+        return redirect(url_for('log_gradient_detector_index'))
+
+    file = request.files['file']
+
+    if file.filename == '' or not allowed_file(file.filename):
+        return redirect(url_for('log_gradient_detector_index'))
+
+    if file:
+        try:
+            base_filename = secure_filename(file.filename)
+            original_filepath = os.path.join(app.config['UPLOAD_FOLDER'], base_filename)
+            file.seek(0)
+            file.save(original_filepath)
+
+            results = process_log_gradient(original_filepath, app.config['UPLOAD_FOLDER'])
+
+            if "error" in results:
+                if os.path.exists(original_filepath):
+                    os.remove(original_filepath)
+                return render_template_string(LOG_GRADIENT_HTML_TEMPLATE, error=results["error"], results=None)
+
+            return render_template_string(LOG_GRADIENT_HTML_TEMPLATE, results=results, error=None)
+
+        except Exception as e:
+            print(f"Error during LoG/Gradient upload: {e}")
+            return render_template_string(LOG_GRADIENT_HTML_TEMPLATE, error=f"An unexpected error occurred: {e}",
+                                          results=None)
+
+
+# --- 4. Keypoint Detector Routes (NEW) ---
+
+@app.route('/keypoint-detector', methods=['GET'])
+def keypoint_detector_index():
+    """Renders the Keypoint detection upload page."""
+    return render_template_string(KEYPOINT_DETECTOR_HTML_TEMPLATE, results=None, error=None)
+
+
+@app.route('/upload-keypoint', methods=['POST'])
+def upload_file_keypoint():
+    """Handles file upload and processing for Edge and Corner Keypoint detection."""
+    if 'file' not in request.files:
+        return redirect(url_for('keypoint_detector_index'))
+
+    file = request.files['file']
+
+    if file.filename == '' or not allowed_file(file.filename):
+        return redirect(url_for('keypoint_detector_index'))
+
+    if file:
+        try:
+            # 1. Save the original file to disk first
+            base_filename = secure_filename(file.filename)
+            original_filepath = os.path.join(app.config['UPLOAD_FOLDER'], base_filename)
+            file.seek(0)
+            file.save(original_filepath)
+
+            # 2. Process the file
+            results = process_keypoint_detection(original_filepath, app.config['UPLOAD_FOLDER'])
+
+            if "error" in results:
+                if os.path.exists(original_filepath):
+                    os.remove(original_filepath)
+                return render_template_string(KEYPOINT_DETECTOR_HTML_TEMPLATE, error=results["error"], results=None)
+
+            # Note: We keep the original file saved for display on the results page
+            results["original_file"] = os.path.basename(original_filepath)
+
+            # 3. Render the results page
+            return render_template_string(KEYPOINT_DETECTOR_HTML_TEMPLATE, results=results, error=None)
+
+        except Exception as e:
+            print(f"Error during Keypoint upload: {e}")
+            return render_template_string(KEYPOINT_DETECTOR_HTML_TEMPLATE, error=f"An unexpected error occurred: {e}",
+                                          results=None)
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print("----------------------------------------------------------------------")
+    print("Flask CV App running...")
+    print("Open your web browser and navigate to: http://127.0.0.1:5000/")
+    print("----------------------------------------------------------------------")
+    app.run(debug=True)
+
